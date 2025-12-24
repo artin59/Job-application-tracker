@@ -10,16 +10,21 @@ from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
+from bs4 import BeautifulSoup
+from email.utils import parseaddr
+import string
 
-
-SCOPES = ["https://www.googleapis.com/auth/gmail.readonly"]
-
-APPLICATION_KEYWORDS = [
-    "thank you for applying",
-    "application received",
-    "we received your application",
-    "thanks for your interest",
+SCOPES = [
+    "https://www.googleapis.com/auth/gmail.readonly",
+    "https://www.googleapis.com/auth/spreadsheets"
 ]
+APPLICATION_KEYWORDS = [
+    "applying",
+    "application",
+    "interest"
+]
+
+
     
 def authentication():
     creds = None
@@ -44,18 +49,53 @@ def authentication():
         with open(token_path, "w") as token:
             token.write(creds.to_json())
 
-    return build("gmail", "v1", credentials=creds)
+    return creds
     
+def get_gmail_service(creds):
+    return build("gmail", "v1", credentials=creds)
+
+def get_sheets_service(creds):
+    return build("sheets", "v4", credentials=creds)
+
 
 def search_application_emails(service):
-    query = " OR ".join([f'"{k}"' for k in APPLICATION_KEYWORDS])
+    subject_query = " OR ".join(
+        [f'subject:"{k}"' for k in APPLICATION_KEYWORDS]
+    )
+
+    inbox_query = f"label:inbox ({subject_query})"
+
     results = service.users().messages().list(
         userId="me",
-        q=query,
+        q=inbox_query,
         maxResults=50
     ).execute()
 
     return results.get("messages", [])
+
+def extract_body_from_payload(payload):
+    body = ""
+
+    if "parts" in payload:
+        for part in payload["parts"]:
+            body += extract_body_from_payload(part)
+    else:
+        mime_type = payload.get("mimeType", "")
+        data = payload.get("body", {}).get("data")
+
+        if data:
+            decoded = base64.urlsafe_b64decode(data).decode(
+                "utf-8", errors="ignore"
+            )
+
+            if mime_type == "text/plain":
+                body += decoded
+            elif mime_type == "text/html":
+                soup = BeautifulSoup(decoded, "html.parser")
+                body += soup.get_text(separator=" ")
+
+    return body
+
 
 def get_message_text(service, msg_id):
     msg = service.users().messages().get(
@@ -75,31 +115,72 @@ def get_message_text(service, msg_id):
         elif h["name"] == "Date":
             date = h["value"]
 
-    body = ""
-
-    parts = msg["payload"].get("parts", [])
-    for part in parts:
-        if part["mimeType"] == "text/plain":
-            body = base64.urlsafe_b64decode(
-                part["body"]["data"]
-            ).decode("utf-8", errors="ignore")
+    body = extract_body_from_payload(msg["payload"])
 
     return subject, sender, date, body
 
+def is_invalid_company(company: str) -> bool:
+    if not company:
+        return True
+
+    if company.lower() == "this":
+        return True
+
+    if company.lower() == "the":
+        return True
+    
+    if re.search(r"\d", company):
+        return True
+
+    return False
+
+def extract_after_keyword(text: str, keyword: str) -> str | None:
+    if not text or not keyword:
+        return None
+
+    pattern = rf"\b{re.escape(keyword)}\s+(\S+)"
+    match = re.search(pattern, text, flags=re.IGNORECASE)
+
+    if not match or is_invalid_company(match.group(1)):
+        return None
+
+    token = match.group(1)
+    token = token.rstrip(string.punctuation)
+    return token
+
+
+
+def extract_company(from_header: str, body_text: str, subject: str) -> str:
+
+    name, email_addr = parseaddr(from_header)
+    email_addr = email_addr.lower()
+
+    if email_addr.endswith("@myworkday.com"):
+        company = email_addr.split("@")[0]
+        if company:
+            return company
+
+    company = extract_after_keyword(body_text, "at")
+    if company:
+        return company
+
+    company = extract_after_keyword(subject, "at")
+    if company:
+        return company
+    
+    
+    return "Unknown"
+
+
 def main():
-    project_root = Path(__file__).parent.parent
-    data_folder = project_root / "data"
-    data_folder.mkdir(exist_ok=True)
-    excel_path = data_folder / "applications.xlsx"
+
 
     service = authentication()
     messages = search_application_emails(service)
     for msg in messages:
-        print(msg)
-
-    for msg in messages:
         subject, sender, date, body = get_message_text(service, msg["id"])
-        print(subject)
+        company = extract_company(sender, subject, body)
+        print(company)
 
 
 
