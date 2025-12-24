@@ -3,16 +3,26 @@ from pathlib import Path
 import base64
 from datetime import datetime
 import re
-
+from dotenv import load_dotenv
 import pandas as pd
 
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
+
 from bs4 import BeautifulSoup
 from email.utils import parseaddr
 import string
+
+
+project_root = Path(__file__).parent.parent
+env_path = project_root / "credentials" / ".env"
+load_dotenv(dotenv_path=env_path)
+
+SPREADSHEET_ID = os.getenv("SPREADSHEET_ID")
+START_ROW = 84
 
 SCOPES = [
     "https://www.googleapis.com/auth/gmail.readonly",
@@ -148,8 +158,12 @@ def extract_after_keyword(text: str, keyword: str) -> str | None:
     token = token.rstrip(string.punctuation)
     return token
 
-
-
+def format_date(date_string: str) -> str:
+    date_string = re.sub(r"\s\([A-Za-z]+\)$", "", date_string)
+    original_format = "%a, %d %b %Y %H:%M:%S %z"  
+    dt_object = datetime.strptime(date_string, original_format)
+    formatted_date = dt_object.strftime("%B %d, %Y")  
+    return formatted_date
 def extract_company(from_header: str, body_text: str, subject: str) -> str:
 
     name, email_addr = parseaddr(from_header)
@@ -171,18 +185,132 @@ def extract_company(from_header: str, body_text: str, subject: str) -> str:
     
     return "Unknown"
 
+def get_next_empty_row(sheets_service, spreadsheet_id):
+    try:
+        for chunk_start in range(START_ROW, START_ROW + 1000, 100):  
+            chunk_end = chunk_start + 99
+            range_name = f"A{chunk_start}:F{chunk_end}"
+            
+            result = sheets_service.spreadsheets().values().get(
+                spreadsheetId=spreadsheet_id,
+                range=range_name
+            ).execute()
+            
+            values = result.get('values', [])
+            
+            for i, row in enumerate(values):
+                row_num = chunk_start + i
+                if not row or all(cell == "" for cell in row[:1]):  #
+                    return row_num
+            
+            if len(values) < 100:
+                return chunk_start + len(values)
+        
+        return START_ROW + 1000
+        
+    except HttpError as error:
+        print(f"Error finding next empty row: {error}")
+        return START_ROW 
+    
+def copy_dropdown_from_above(sheets_service, spreadsheet_id, start_row, num_rows):
 
+    source_row_index = start_row - 2 
+
+    requests = [
+        {
+            "copyPaste": {
+                "source": {
+                    "sheetId": 0,
+                    "startRowIndex": source_row_index,
+                    "endRowIndex": source_row_index + 1,
+                    "startColumnIndex": 4, 
+                    "endColumnIndex": 5
+                },
+                "destination": {
+                    "sheetId": 0,
+                    "startRowIndex": start_row - 1,
+                    "endRowIndex": start_row - 1 + num_rows,
+                    "startColumnIndex": 4,
+                    "endColumnIndex": 5
+                },
+                "pasteType": "PASTE_DATA_VALIDATION"
+            }
+        }
+    ]
+
+    sheets_service.spreadsheets().batchUpdate(
+        spreadsheetId=spreadsheet_id,
+        body={"requests": requests}
+    ).execute()
+
+
+
+def update_google_sheet(sheets_service, spreadsheet_id, new_entries):
+    if not new_entries:
+        return
+    
+    try:
+        start_row = get_next_empty_row(sheets_service, spreadsheet_id)
+        
+        values = []
+        for entry in new_entries:
+            values.append([
+                entry["Company Name"],  
+                "",                     
+                "",                     
+                entry["Date Applied"],  
+                "Applied ",              
+                ""                      
+            ])
+        
+        end_row = start_row + len(values) - 1
+        range_name = f"A{start_row}:F{end_row}"
+        
+        body = {
+            "values": values
+        }
+        
+        update_result = sheets_service.spreadsheets().values().update(
+            spreadsheetId=spreadsheet_id,
+            range=range_name,
+            valueInputOption="USER_ENTERED",
+            body=body
+        ).execute()
+        
+        copy_dropdown_from_above(
+            sheets_service,
+            spreadsheet_id,
+            start_row,
+            len(values)
+        )
+
+        return start_row
+        
+    except HttpError as error:
+        return None
+    
 def main():
+    creds = authentication()
+    gmail_service = get_gmail_service(creds)
+    sheets_service = get_sheets_service(creds)
 
+    messages = search_application_emails(gmail_service)
 
-    service = authentication()
-    messages = search_application_emails(service)
-    for msg in messages:
-        subject, sender, date, body = get_message_text(service, msg["id"])
+    new_entries = []
+
+    for msg in reversed(messages):
+        subject, sender, date, body = get_message_text(gmail_service, msg["id"])
         company = extract_company(sender, subject, body)
-        print(company)
-
-
+        if company != "Unknown":
+            entry = {
+                "Company Name": company.capitalize(),
+                "Date Applied": format_date(date),
+            }
+            new_entries.append(entry)
+    
+    
+    if new_entries:
+        update_google_sheet(sheets_service, SPREADSHEET_ID, new_entries)     
 
 if __name__ == "__main__":
   main()
